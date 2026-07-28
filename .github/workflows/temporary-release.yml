@@ -1,0 +1,154 @@
+name: Build temporary 15-minute release
+
+on:
+  push:
+    branches:
+      - 'devspace/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: temporary-release
+  cancel-in-progress: true
+
+jobs:
+  build-release-delete:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      VERSION: '2.2.11'
+      TAG: temporary-download
+      ASSET: LobeHub-Portable-2.2.11-Custom-win-x64.zip
+      INSTALLER_SHA256: da4229aaa72f5edbcef73adcbfb2c2fdfa5ce30116aa0774a7f67cd2e925617a
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install ASAR packer
+        shell: pwsh
+        run: npm install --no-save @electron/asar@3.4.1
+
+      - name: Download and verify official LobeHub installer
+        shell: pwsh
+        run: |
+          New-Item build -ItemType Directory -Force | Out-Null
+          $url = "https://github.com/lobehub/lobehub/releases/download/v$env:VERSION/LobeHub-$env:VERSION-setup.exe"
+          Invoke-WebRequest $url -OutFile build\LobeHub-setup.exe
+          $actual = (Get-FileHash build\LobeHub-setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $env:INSTALLER_SHA256) {
+            throw "Installer SHA-256 mismatch: $actual"
+          }
+
+      - name: Extract without running installer
+        shell: pwsh
+        run: |
+          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+          & $sevenZip x -y build\LobeHub-setup.exe -obuild\portable | Out-Null
+          if (-not (Test-Path build\portable\resources\app.asar)) {
+            throw 'resources/app.asar was not extracted.'
+          }
+          npx asar extract build\portable\resources\app.asar build\app
+
+      - name: Apply UI and provider customization
+        shell: pwsh
+        run: node scripts\patch.mjs build\app
+
+      - name: Repack application resources
+        shell: pwsh
+        run: |
+          npx asar pack build\app build\patched\app.asar --unpack '{**/*.node,**/font-list/libs/darwin/fontlist,**/get-windows/main}'
+          Copy-Item build\patched\app.asar build\portable\resources\app.asar -Force
+          Remove-Item build\portable\resources\app.asar.unpacked -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item build\patched\app.asar.unpacked build\portable\resources\app.asar.unpacked -Recurse -Force
+
+      - name: Add package documentation
+        shell: pwsh
+        run: |
+          @'
+          LobeHub Desktop 2.2.11 Custom Portable
+
+          - No installer is executed; extract the ZIP and run LobeHub.exe.
+          - Paid-upgrade promotion cards and purchase entry points are hidden.
+          - Account, usage, normal settings, and Provider pages remain visible.
+          - The LobeHub Provider remains visible and receives the normal on/off switch.
+          - On first launch per user profile, the LobeHub Provider is disabled once.
+          - Later manual changes are preserved.
+          - This does not unlock paid features or alter server-side subscriptions, quotas, or permissions.
+
+          This package is built from the official LobeHub 2.2.11 installer.
+          Upstream project: https://github.com/lobehub/lobehub
+          '@ | Set-Content build\portable\README-CUSTOM.txt -Encoding UTF8
+
+      - name: Validate package
+        shell: pwsh
+        run: |
+          $required = @(
+            'LobeHub.exe',
+            'resources\app.asar',
+            'resources\app.asar.unpacked',
+            'resources.pak',
+            'icudtl.dat',
+            'libEGL.dll',
+            'libGLESv2.dll',
+            'ffmpeg.dll'
+          )
+          foreach ($item in $required) {
+            if (-not (Test-Path (Join-Path build\portable $item))) {
+              throw "Missing required file: $item"
+            }
+          }
+          npx asar list build\portable\resources\app.asar | Select-String 'lobehub-customization-runtime.js' | Out-Null
+          $nativeCount = (Get-ChildItem build\portable\resources\app.asar.unpacked -Recurse -Filter *.node).Count
+          if ($nativeCount -lt 9) { throw "Expected at least 9 native modules, found $nativeCount" }
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
+          Push-Location build
+          & $sevenZip a -tzip -mx=0 "..\$env:ASSET" portable | Out-Null
+          Pop-Location
+          & $sevenZip t $env:ASSET | Out-Null
+          $hash = (Get-FileHash $env:ASSET -Algorithm SHA256).Hash.ToLowerInvariant()
+          "ASSET_SHA256=$hash" | Out-File $env:GITHUB_ENV -Append
+          "### Temporary download`n`nSHA-256: ``$hash``" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Replace previous temporary release
+        shell: pwsh
+        run: |
+          gh release delete $env:TAG --cleanup-tag --yes 2>$null
+          exit 0
+
+      - name: Publish temporary release
+        shell: pwsh
+        run: |
+          $expires = (Get-Date).ToUniversalTime().AddMinutes(15).ToString('yyyy-MM-dd HH:mm:ss UTC')
+          $notes = @"
+          Temporary customized LobeHub Desktop 2.2.11 portable package.
+
+          This Release and its asset are scheduled for deletion at approximately $expires.
+          SHA-256: $env:ASSET_SHA256
+          "@
+          gh release create $env:TAG $env:ASSET --title 'Temporary LobeHub custom portable download' --notes $notes
+          $url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$env:ASSET"
+          "### Download link`n`n$url`n`nScheduled deletion: $expires" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Keep release available for 15 minutes
+        shell: pwsh
+        run: Start-Sleep -Seconds 900
+
+      - name: Delete temporary release and asset
+        if: always()
+        shell: pwsh
+        run: |
+          gh release delete $env:TAG --cleanup-tag --yes 2>$null
+          exit 0

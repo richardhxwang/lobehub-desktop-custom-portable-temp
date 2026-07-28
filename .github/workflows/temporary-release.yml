@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build-release-delete:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       VERSION: '2.2.11'
@@ -33,47 +33,43 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install ASAR packer
-        shell: pwsh
-        run: npm install --no-save @electron/asar@3.4.1
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+          npm install --no-save @electron/asar@3.4.1
 
       - name: Download and verify official LobeHub installer
-        shell: pwsh
         run: |
-          New-Item build -ItemType Directory -Force | Out-Null
-          $url = "https://github.com/lobehub/lobehub/releases/download/v$env:VERSION/LobeHub-$env:VERSION-setup.exe"
-          Invoke-WebRequest $url -OutFile build\LobeHub-setup.exe
-          $actual = (Get-FileHash build\LobeHub-setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $env:INSTALLER_SHA256) {
-            throw "Installer SHA-256 mismatch: $actual"
-          }
+          mkdir -p build
+          curl -fL --retry 3 \
+            "https://github.com/lobehub/lobehub/releases/download/v${VERSION}/LobeHub-${VERSION}-setup.exe" \
+            -o build/LobeHub-setup.exe
+          echo "${INSTALLER_SHA256}  build/LobeHub-setup.exe" | sha256sum -c -
 
       - name: Extract without running installer
-        shell: pwsh
         run: |
-          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-          & $sevenZip x -y build\LobeHub-setup.exe -obuild\portable | Out-Null
-          if (-not (Test-Path build\portable\resources\app.asar)) {
-            throw 'resources/app.asar was not extracted.'
-          }
-          npx asar extract build\portable\resources\app.asar build\app
+          mkdir -p build/portable build/app
+          7z x -y build/LobeHub-setup.exe -obuild/portable
+          test -f build/portable/resources/app.asar
+          npx asar extract build/portable/resources/app.asar build/app
+          test -f build/app/dist/renderer/apps/desktop/index.html
 
       - name: Apply UI and provider customization
-        shell: pwsh
-        run: node scripts\patch.mjs build\app
+        run: node scripts/patch.mjs build/app
 
       - name: Repack application resources
-        shell: pwsh
         run: |
-          npx asar pack build\app build\patched\app.asar --unpack '{**/*.node,**/font-list/libs/darwin/fontlist,**/get-windows/main}'
-          Copy-Item build\patched\app.asar build\portable\resources\app.asar -Force
-          Remove-Item build\portable\resources\app.asar.unpacked -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item build\patched\app.asar.unpacked build\portable\resources\app.asar.unpacked -Recurse -Force
+          mkdir -p build/patched
+          npx asar pack build/app build/patched/app.asar \
+            --unpack '{**/*.node,**/font-list/libs/darwin/fontlist,**/get-windows/main}'
+          cp build/patched/app.asar build/portable/resources/app.asar
+          rm -rf build/portable/resources/app.asar.unpacked
+          cp -a build/patched/app.asar.unpacked build/portable/resources/app.asar.unpacked
 
       - name: Add package documentation
-        shell: pwsh
         run: |
-          @'
+          cat > build/portable/README-CUSTOM.txt <<'EOF'
           LobeHub Desktop 2.2.11 Custom Portable
 
           - No installer is executed; extract the ZIP and run LobeHub.exe.
@@ -86,69 +82,63 @@ jobs:
 
           This package is built from the official LobeHub 2.2.11 installer.
           Upstream project: https://github.com/lobehub/lobehub
-          '@ | Set-Content build\portable\README-CUSTOM.txt -Encoding UTF8
+          EOF
 
       - name: Validate package
-        shell: pwsh
         run: |
-          $required = @(
-            'LobeHub.exe',
-            'resources\app.asar',
-            'resources\app.asar.unpacked',
-            'resources.pak',
-            'icudtl.dat',
-            'libEGL.dll',
-            'libGLESv2.dll',
-            'ffmpeg.dll'
-          )
-          foreach ($item in $required) {
-            if (-not (Test-Path (Join-Path build\portable $item))) {
-              throw "Missing required file: $item"
-            }
-          }
-          npx asar list build\portable\resources\app.asar | Select-String 'lobehub-customization-runtime.js' | Out-Null
-          $nativeCount = (Get-ChildItem build\portable\resources\app.asar.unpacked -Recurse -Filter *.node).Count
-          if ($nativeCount -lt 9) { throw "Expected at least 9 native modules, found $nativeCount" }
+          test -f build/portable/LobeHub.exe
+          test -f build/portable/resources/app.asar
+          test -d build/portable/resources/app.asar.unpacked
+          test -f build/portable/resources.pak
+          test -f build/portable/icudtl.dat
+          test -f build/portable/libEGL.dll
+          test -f build/portable/libGLESv2.dll
+          test -f build/portable/ffmpeg.dll
+          npx asar list build/portable/resources/app.asar | grep -q 'lobehub-customization-runtime.js'
+          native_count="$(find build/portable/resources/app.asar.unpacked -type f -iname '*.node' | wc -l)"
+          test "$native_count" -ge 9
+          file build/portable/LobeHub.exe | grep -q 'PE32+ executable'
 
       - name: Create ZIP
-        shell: pwsh
         run: |
-          $sevenZip = "$env:ProgramFiles\7-Zip\7z.exe"
-          Push-Location build
-          & $sevenZip a -tzip -mx=0 "..\$env:ASSET" portable | Out-Null
-          Pop-Location
-          & $sevenZip t $env:ASSET | Out-Null
-          $hash = (Get-FileHash $env:ASSET -Algorithm SHA256).Hash.ToLowerInvariant()
-          "ASSET_SHA256=$hash" | Out-File $env:GITHUB_ENV -Append
-          "### Temporary download`n`nSHA-256: ``$hash``" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          rm -f "$ASSET"
+          (cd build && 7z a -tzip -mx=0 "../$ASSET" portable)
+          7z t "$ASSET"
+          hash="$(sha256sum "$ASSET" | awk '{print $1}')"
+          echo "ASSET_SHA256=$hash" >> "$GITHUB_ENV"
+          {
+            echo '### Temporary download'
+            echo
+            echo "SHA-256: \`$hash\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Replace previous temporary release
-        shell: pwsh
-        run: |
-          gh release delete $env:TAG --cleanup-tag --yes 2>$null
-          exit 0
+        run: gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
 
       - name: Publish temporary release
-        shell: pwsh
         run: |
-          $expires = (Get-Date).ToUniversalTime().AddMinutes(15).ToString('yyyy-MM-dd HH:mm:ss UTC')
-          $notes = @"
+          expires="$(date -u -d '+15 minutes' '+%Y-%m-%d %H:%M:%S UTC')"
+          cat > /tmp/release-notes.txt <<EOF
           Temporary customized LobeHub Desktop 2.2.11 portable package.
 
           This Release and its asset are scheduled for deletion at approximately $expires.
-          SHA-256: $env:ASSET_SHA256
-          "@
-          gh release create $env:TAG $env:ASSET --title 'Temporary LobeHub custom portable download' --notes $notes
-          $url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/$env:ASSET"
-          "### Download link`n`n$url`n`nScheduled deletion: $expires" | Out-File $env:GITHUB_STEP_SUMMARY -Append
+          SHA-256: $ASSET_SHA256
+          EOF
+          gh release create "$TAG" "$ASSET" \
+            --title 'Temporary LobeHub custom portable download' \
+            --notes-file /tmp/release-notes.txt
+          url="https://github.com/${{ github.repository }}/releases/download/$TAG/$ASSET"
+          {
+            echo '### Download link'
+            echo
+            echo "$url"
+            echo
+            echo "Scheduled deletion: $expires"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Keep release available for 15 minutes
-        shell: pwsh
-        run: Start-Sleep -Seconds 900
+        run: sleep 900
 
       - name: Delete temporary release and asset
         if: always()
-        shell: pwsh
-        run: |
-          gh release delete $env:TAG --cleanup-tag --yes 2>$null
-          exit 0
+        run: gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true

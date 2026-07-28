@@ -49,8 +49,22 @@ jobs:
 
       - name: Extract without running installer
         run: |
-          mkdir -p build/portable build/app
-          7z x -y build/LobeHub-setup.exe -obuild/portable
+          mkdir -p build/stage build/portable build/app
+          7z x -y build/LobeHub-setup.exe -obuild/stage
+
+          if [ -f build/stage/resources/app.asar ]; then
+            cp -a build/stage/. build/portable/
+          else
+            inner_archive="$(find build/stage -type f \( -iname 'app-*.7z' -o -iname 'app.7z' \) | head -n 1)"
+            if [ -z "$inner_archive" ]; then
+              echo 'Installer extraction did not produce resources/app.asar or an inner app archive.' >&2
+              find build/stage -maxdepth 4 -type f -printf '%P\n' | sort | head -n 200
+              exit 1
+            fi
+            echo "Extracting inner application archive: $inner_archive"
+            7z x -y "$inner_archive" -obuild/portable
+          fi
+
           test -f build/portable/resources/app.asar
           npx asar extract build/portable/resources/app.asar build/app
           test -f build/app/dist/renderer/apps/desktop/index.html
